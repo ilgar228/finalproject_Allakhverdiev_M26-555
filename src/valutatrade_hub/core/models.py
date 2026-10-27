@@ -6,6 +6,12 @@ import hashlib
 import secrets
 from datetime import datetime
 
+from valutatrade_hub.core.currencies import Currency, get_currency
+from valutatrade_hub.core.exceptions import (
+    CurrencyNotFoundError,
+    InsufficientFundsError,
+)
+
 
 class User:
     """Зарегистрированный пользователь платформы."""
@@ -77,8 +83,12 @@ class User:
         )
 
     def verify_password(self, password: str) -> bool:
-        """Проверяет, совпадает ли пароль с сохранённым хешем."""
-        if not isinstance(password, str):
+        """Проверяет, совпадает ли пароль с сохранённым хешем.
+
+        Возвращает False для заведомо невалидных паролей (не строка, короче 4),
+        не поднимая исключение — это соответствует поведению «пароль не подходит».
+        """
+        if not isinstance(password, str) or len(password) < 4:
             return False
         return self._hash_password(password, self._salt) == self._hashed_password
 
@@ -131,6 +141,11 @@ class Wallet:
         self.balance = balance  # присваивание идёт через сеттер с проверкой
 
     @property
+    def currency(self) -> Currency:
+        """Объект валюты из иерархии currencies (точка интеграции)."""
+        return get_currency(self.currency_code)
+
+    @property
     def balance(self) -> float:
         return self._balance
 
@@ -157,12 +172,16 @@ class Wallet:
         self._balance += self._validate_amount(amount)
 
     def withdraw(self, amount: float) -> None:
-        """Снимает средства, если баланса достаточно."""
+        """Снимает средства, если баланса достаточно.
+
+        Кидает InsufficientFundsError, если средств не хватает.
+        """
         amount = self._validate_amount(amount)
         if amount > self._balance:
-            raise ValueError(
-                f"Недостаточно средств: доступно {self._balance} "
-                f"{self.currency_code}, требуется {amount} {self.currency_code}"
+            raise InsufficientFundsError(
+                available=self._balance,
+                required=amount,
+                code=self.currency_code,
             )
         self._balance -= amount
 
@@ -187,15 +206,6 @@ class Wallet:
 
 class Portfolio:
     """Набор кошельков одного пользователя."""
-
-    # Фиксированные курсы к USD (заглушка, пока нет Parser Service).
-    EXCHANGE_RATES = {
-        "USD": 1.0,
-        "EUR": 1.0786,
-        "RUB": 0.01016,
-        "BTC": 59337.21,
-        "ETH": 3720.00,
-    }
 
     def __init__(
         self,
@@ -231,10 +241,15 @@ class Portfolio:
         return dict(self._wallets)
 
     def add_currency(self, currency_code: str) -> Wallet:
-        """Добавляет новый кошелёк, если такого ещё нет. Возвращает его."""
+        """Добавляет новый кошелёк, если такого ещё нет. Возвращает его.
+
+        Валидирует код через иерархию валют (CurrencyNotFoundError для неизвестных).
+        """
         if not isinstance(currency_code, str) or not currency_code.strip():
             raise ValueError("Код валюты не может быть пустым")
         code = currency_code.strip().upper()
+        # проверка, что валюта известна (кидает CurrencyNotFoundError)
+        get_currency(code)
         if code in self._wallets:
             raise ValueError(f"Кошелёк '{code}' уже существует в портфеле")
         wallet = Wallet(code)
@@ -247,20 +262,49 @@ class Portfolio:
             return None
         return self._wallets.get(currency_code.strip().upper())
 
-    def get_total_value(self, base_currency: str = "USD") -> float:
-        """Считает общую стоимость всех кошельков в базовой валюте."""
+    def get_total_value(
+        self,
+        base_currency: str = "USD",
+        rate_provider=None,
+    ) -> float:
+        """Считает общую стоимость всех кошельков в базовой валюте.
+
+        Если передан rate_provider(code, base) -> float, используется он.
+        Иначе — фиксированные курсы-заглушки из EXCHANGE_RATES.
+        """
         base = base_currency.strip().upper() if isinstance(base_currency, str) else ""
-        if base not in self.EXCHANGE_RATES:
-            raise ValueError(f"Неизвестная базовая валюта '{base_currency}'")
-        base_rate = self.EXCHANGE_RATES[base]
+        try:
+            get_currency(base)
+        except CurrencyNotFoundError:
+            raise CurrencyNotFoundError(base) from None
 
         total = 0.0
         for code, wallet in self._wallets.items():
-            if code not in self.EXCHANGE_RATES:
-                raise ValueError(f"Нет курса для валюты '{code}'")
-            value_in_usd = wallet.balance * self.EXCHANGE_RATES[code]
-            total += value_in_usd / base_rate
+            if code == base:
+                total += wallet.balance
+                continue
+            if rate_provider is not None:
+                rate = rate_provider(code, base)
+            else:
+                rate = self._fallback_rate(code, base)
+            total += wallet.balance * rate
         return total
+
+    @staticmethod
+    def _fallback_rate(code: str, base: str) -> float:
+        """Фиксированные курсы-заглушки, если rate_provider не передан."""
+        rates = {
+            "USD": 1.0,
+            "EUR": 1.0786,
+            "RUB": 0.01016,
+            "BTC": 59337.21,
+            "ETH": 3720.00,
+        }
+        if code not in rates:
+            raise CurrencyNotFoundError(code)
+        if base not in rates:
+            raise CurrencyNotFoundError(base)
+        return rates[code] / rates[base]
 
     # --- (де)сериализация ---
 

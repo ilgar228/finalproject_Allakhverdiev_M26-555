@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Any
 
 from valutatrade_hub.core import utils
+from valutatrade_hub.core.exceptions import (
+    ApiRequestError,
+    InsufficientFundsError,
+)
 from valutatrade_hub.core.models import Portfolio, User
+from valutatrade_hub.decorators import log_action
+from valutatrade_hub.infra.database import get_database
+from valutatrade_hub.infra.settings import get_settings
 
 # Текущий залогиненный пользователь (сессия в рамках процесса CLI)
 _current_user: User | None = None
-
-# Курс считается свежим, если обновлён не позже этого интервала
-RATE_TTL = timedelta(minutes=5)
 
 
 # --- сессия ---
@@ -37,7 +42,6 @@ def logout() -> None:
 # --- вспомогательное ---
 
 def _next_user_id(users: list[dict]) -> int:
-    """Возвращает следующий свободный user_id (автоинкремент)."""
     if not users:
         return 1
     return max(int(u["user_id"]) for u in users) + 1
@@ -52,7 +56,8 @@ def _find_user_record(users: list[dict], username: str) -> dict | None:
 
 def _load_portfolio_for(user_id: int) -> Portfolio:
     """Загружает портфель пользователя из portfolios.json (или пустой)."""
-    records = utils.load_portfolios()
+    db = get_database()
+    records = db.load(db.portfolios_file, [])
     for rec in records:
         if int(rec["user_id"]) == user_id:
             return Portfolio.from_dict(rec)
@@ -61,21 +66,19 @@ def _load_portfolio_for(user_id: int) -> Portfolio:
 
 def _save_portfolio(portfolio: Portfolio) -> None:
     """Сохраняет портфель, заменяя запись с тем же user_id."""
-    records = utils.load_portfolios()
+    db = get_database()
     new_rec = portfolio.to_dict()
-    for i, rec in enumerate(records):
-        if int(rec["user_id"]) == portfolio.user_id:
-            records[i] = new_rec
-            break
-    else:
+
+    def mutator(records: list[dict]) -> list[dict]:
+        records = records or []
+        for i, rec in enumerate(records):
+            if int(rec["user_id"]) == portfolio.user_id:
+                records[i] = new_rec
+                return records
         records.append(new_rec)
-    utils.save_portfolios(records)
+        return records
 
-
-def _normalize_currency(code: str) -> str:
-    if not isinstance(code, str) or not code.strip():
-        raise ValueError("Код валюты не может быть пустым")
-    return code.strip().upper()
+    db.update(db.portfolios_file, mutator, default=[])
 
 
 def _validate_amount(amount: float) -> float:
@@ -94,11 +97,32 @@ def _ensure_wallet(portfolio: Portfolio, code: str):
     return wallet
 
 
+def _rates_ttl() -> timedelta:
+    settings = get_settings()
+    return timedelta(seconds=settings.rates_ttl_seconds)
+
+
+def _strict_ttl() -> bool:
+    settings = get_settings()
+    return bool(settings.get("rates_strict_ttl", False))
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 # --- регистрация и логин ---
 
+@log_action("REGISTER")
 def register(username: str, password: str) -> dict:
     """Создаёт нового пользователя и пустой портфель."""
-    users = utils.load_users()
+    db = get_database()
+    users = db.load(db.users_file, [])
     if not isinstance(username, str) or not username.strip():
         raise ValueError("Имя пользователя не может быть пустым")
     username = username.strip()
@@ -108,16 +132,18 @@ def register(username: str, password: str) -> dict:
     user_id = _next_user_id(users)
     user = User.create(user_id=user_id, username=username, password=password)
     users.append(user.to_dict())
-    utils.save_users(users)
+    db.save(db.users_file, users)
 
     _save_portfolio(Portfolio(user_id=user_id))
     return {"user_id": user_id, "username": username}
 
 
+@log_action("LOGIN")
 def login(username: str, password: str) -> dict:
     """Логинит пользователя, сохраняя его в сессии."""
     global _current_user
-    users = utils.load_users()
+    db = get_database()
+    users = db.load(db.users_file, [])
     name = username.strip() if isinstance(username, str) else ""
     record = _find_user_record(users, name)
     if record is None:
@@ -136,14 +162,14 @@ def show_portfolio(base: str = "USD") -> dict:
     user = _require_login()
     portfolio = _load_portfolio_for(user.user_id)
     portfolio.attach_user(user)
-    base = _normalize_currency(base)
+    base_code = utils.validate_currency_code(base)
 
     rows = []
     for code, wallet in portfolio.wallets.items():
-        if code == base:
+        if code == base_code:
             value = wallet.balance
         else:
-            rate = get_rate(code, base)["rate"]
+            rate = get_rate(code, base_code)["rate"]
             value = wallet.balance * rate
         rows.append(
             {
@@ -152,10 +178,14 @@ def show_portfolio(base: str = "USD") -> dict:
                 "value_in_base": value,
             }
         )
-    total = portfolio.get_total_value(base)
+
+    total = portfolio.get_total_value(
+        base_code,
+        rate_provider=lambda c, b: get_rate(c, b)["rate"],
+    )
     return {
         "username": user.username,
-        "base": base,
+        "base": base_code,
         "wallets": rows,
         "total": total,
     }
@@ -164,39 +194,40 @@ def show_portfolio(base: str = "USD") -> dict:
 # --- покупка/продажа (через USD-кошелёк) ---
 
 def _estimate_usd_amount(currency: str, amount: float) -> tuple[float, dict | None]:
-    """Возвращает (сумма в USD, информация о курсе или None для USD)."""
     if currency == "USD":
         return amount, None
     rate_info = get_rate(currency, "USD")
     return amount * rate_info["rate"], rate_info
 
 
+@log_action("BUY", verbose=True)
 def buy(currency: str, amount: float) -> dict:
     """Покупает валюту: списывает USD и увеличивает баланс кошелька."""
     user = _require_login()
-    code = _normalize_currency(currency)
+    code = utils.validate_currency_code(currency)
     amount = _validate_amount(amount)
 
     portfolio = _load_portfolio_for(user.user_id)
-
     usd_cost, rate_info = _estimate_usd_amount(code, amount)
+
     if code != "USD":
-        # Списываем USD со счёта
         usd_wallet = _ensure_wallet(portfolio, "USD")
         usd_before = usd_wallet.balance
-        if usd_cost > usd_before:
-            raise ValueError(
-                f"Недостаточно средств: доступно {usd_before:.2f} USD, "
-                f"требуется {usd_cost:.2f} USD"
-            )
-        usd_wallet.withdraw(usd_cost)
+        try:
+            usd_wallet.withdraw(usd_cost)
+        except InsufficientFundsError as e:
+            raise InsufficientFundsError(
+                available=e.available, required=e.required, code="USD"
+            ) from None
     else:
-        usd_wallet = portfolio.get_wallet("USD")
-        usd_before = usd_wallet.balance if usd_wallet else 0.0
+        usd_wallet = _ensure_wallet(portfolio, "USD")
+        usd_before = usd_wallet.balance
+        usd_wallet.deposit(amount)
 
     target_wallet = _ensure_wallet(portfolio, code)
     before = target_wallet.balance
-    target_wallet.deposit(amount)
+    if code != "USD":
+        target_wallet.deposit(amount)
     _save_portfolio(portfolio)
 
     return {
@@ -207,18 +238,18 @@ def buy(currency: str, amount: float) -> dict:
         "rate": rate_info["rate"] if rate_info else None,
         "estimated_usd": usd_cost,
         "usd_before": usd_before,
-        "usd_after": (
-            portfolio.get_wallet("USD").balance
-            if portfolio.get_wallet("USD")
-            else 0.0
-        ),
+        "usd_after": portfolio.get_wallet("USD").balance
+        if portfolio.get_wallet("USD")
+        else 0.0,
+        "user": user.username,
     }
 
 
+@log_action("SELL", verbose=True)
 def sell(currency: str, amount: float) -> dict:
     """Продаёт валюту: уменьшает баланс кошелька и начисляет USD."""
     user = _require_login()
-    code = _normalize_currency(currency)
+    code = utils.validate_currency_code(currency)
     amount = _validate_amount(amount)
 
     portfolio = _load_portfolio_for(user.user_id)
@@ -230,9 +261,8 @@ def sell(currency: str, amount: float) -> dict:
         )
 
     proceeds_usd, rate_info = _estimate_usd_amount(code, amount)
-
     before = wallet.balance
-    wallet.withdraw(amount)
+    wallet.withdraw(amount)  # кидает InsufficientFundsError при нехватке
 
     usd_before = 0.0
     if code != "USD":
@@ -250,29 +280,49 @@ def sell(currency: str, amount: float) -> dict:
         "rate": rate_info["rate"] if rate_info else None,
         "estimated_usd": proceeds_usd,
         "usd_before": usd_before,
-        "usd_after": (
-            portfolio.get_wallet("USD").balance
-            if portfolio.get_wallet("USD")
-            else 0.0
-        ),
+        "usd_after": portfolio.get_wallet("USD").balance
+        if portfolio.get_wallet("USD")
+        else 0.0,
+        "user": user.username,
     }
 
 
 # --- курсы ---
 
-def _parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
+def _get_rate_from_cache(
+    src: str, dst: str
+) -> tuple[float, str | None, dict[str, Any]]:
+    """Ищет курс в rates.json (прямой или обратный).
+
+    Возвращает (rate, updated_at, rates).
+    """
+    rates = utils.load_rates()
+    direct_key = f"{src}_{dst}"
+    inverse_key = f"{dst}_{src}"
+
+    if direct_key in rates and isinstance(rates[direct_key], dict):
+        rec = rates[direct_key]
+        return float(rec["rate"]), rec.get("updated_at"), rates
+    if inverse_key in rates and isinstance(rates[inverse_key], dict):
+        rec = rates[inverse_key]
+        inverse = float(rec["rate"])
+        rate = 1.0 / inverse if inverse else 0.0
+        return rate, rec.get("updated_at"), rates
+
+    raise ApiRequestError(f"нет данных для {src}→{dst}")
 
 
+@log_action("GET_RATE")
 def get_rate(from_currency: str, to_currency: str) -> dict:
-    """Возвращает курс from→to из кеша rates.json и признак свежести."""
-    src = _normalize_currency(from_currency)
-    dst = _normalize_currency(to_currency)
+    """Возвращает курс from→to из кеша rates.json и признак свежести.
+
+    Если кеш устарел:
+      - при rates_strict_ttl = true  → ApiRequestError;
+      - иначе                        → возвращаем с stale=True.
+    """
+    src = utils.validate_currency_code(from_currency)
+    dst = utils.validate_currency_code(to_currency)
+
     if src == dst:
         return {
             "rate": 1.0,
@@ -282,30 +332,22 @@ def get_rate(from_currency: str, to_currency: str) -> dict:
             "stale": False,
         }
 
-    rates = utils.load_rates()
-    direct_key = f"{src}_{dst}"
-    inverse_key = f"{dst}_{src}"
+    try:
+        rate, updated_at, rates = _get_rate_from_cache(src, dst)
+    except ApiRequestError:
+        # нет курса — это уже ApiRequestError
+        raise
 
-    record = None
-    rate = None
-    if direct_key in rates and isinstance(rates[direct_key], dict):
-        record = rates[direct_key]
-        rate = float(record["rate"])
-    elif inverse_key in rates and isinstance(rates[inverse_key], dict):
-        record = rates[inverse_key]
-        inverse = float(record["rate"])
-        rate = 1.0 / inverse if inverse else 0.0
-
-    if record is None or rate is None:
-        raise ValueError(
-            f"Курс {src}→{dst} недоступен. Повторите попытку позже."
-        )
-
-    updated_at = record.get("updated_at")
     updated_dt = _parse_iso(updated_at)
     fresh = True
     if updated_dt is not None:
-        fresh = (datetime.now() - updated_dt) <= RATE_TTL
+        fresh = (datetime.now() - updated_dt) <= _rates_ttl()
+
+    if not fresh and _strict_ttl():
+        # В строгом режиме пытаемся «обновить» — заглушка Parser Service недоступна
+        raise ApiRequestError(
+            f"кеш курса {src}→{dst} устарел, Parser Service недоступен"
+        )
 
     return {
         "rate": rate,
@@ -314,3 +356,8 @@ def get_rate(from_currency: str, to_currency: str) -> dict:
         "fresh": fresh,
         "stale": not fresh,
     }
+
+
+def now_iso() -> str:
+    """Текущее время в ISO-формате (для CLI/логов)."""
+    return datetime.now().isoformat(timespec="seconds")

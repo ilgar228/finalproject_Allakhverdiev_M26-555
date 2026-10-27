@@ -1,67 +1,71 @@
-"""Вспомогательные функции: работа с JSON-хранилищем и путями."""
+"""Вспомогательные функции: валидация валют, конвертация, JSON-обёртки."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
+from typing import Any, Callable
 
-# Корень проекта: .../final_project
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DATA_DIR = PROJECT_ROOT / "data"
+from valutatrade_hub.core.currencies import get_currency
+from valutatrade_hub.infra.database import get_database
 
-USERS_FILE = DATA_DIR / "users.json"
-PORTFOLIOS_FILE = DATA_DIR / "portfolios.json"
-RATES_FILE = DATA_DIR / "rates.json"
+# --- валидация валютных кодов ---
 
+def validate_currency_code(code: str) -> str:
+    """Нормализует код валюты и проверяет, что он известен.
 
-def ensure_data_dir() -> None:
-    """Создаёт папку data/, если её ещё нет."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def load_json(path: Path, default):
-    """Загружает JSON из файла. Если файла нет — возвращает default."""
-    if not path.exists():
-        return default
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return default
+    Возвращает код в верхнем регистре. Кидает CurrencyNotFoundError для неизвестных.
+    """
+    currency = get_currency(code)  # сам нормализует и кидает при неизвестном
+    return currency.code
 
 
-def save_json(path: Path, data) -> None:
-    """Сохраняет данные в JSON-файл (с отступами и без ASCII-эскейпов)."""
-    ensure_data_dir()
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+# --- конвертация ---
+
+RateProvider = Callable[[str, str], float]
 
 
-# --- users ---
+def convert(
+    amount: float,
+    from_code: str,
+    to_code: str,
+    rate_provider: RateProvider,
+) -> float:
+    """Конвертирует amount из from_code в to_code через rate_provider.
+
+    rate_provider(from_code, to_code) должен вернуть курс (сколько to за 1 from).
+    """
+    if not isinstance(amount, (int, float)) or isinstance(amount, bool):
+        raise TypeError("Сумма должна быть числом")
+    src = validate_currency_code(from_code)
+    dst = validate_currency_code(to_code)
+    if src == dst:
+        return float(amount)
+    rate = rate_provider(src, dst)
+    return float(amount) * rate
+
+
+# --- JSON-обёртки (тонкий слой над DatabaseManager) ---
+# Оставлены для обратной совместимости и удобства в тестах/скриптах.
 
 def load_users() -> list[dict]:
-    return load_json(USERS_FILE, [])
+    return get_database().load(get_database().users_file, [])
 
 
 def save_users(users: list[dict]) -> None:
-    save_json(USERS_FILE, users)
+    get_database().save(get_database().users_file, users)
 
-
-# --- portfolios ---
 
 def load_portfolios() -> list[dict]:
-    return load_json(PORTFOLIOS_FILE, [])
+    return get_database().load(get_database().portfolios_file, [])
 
 
 def save_portfolios(portfolios: list[dict]) -> None:
-    save_json(PORTFOLIOS_FILE, portfolios)
+    get_database().save(get_database().portfolios_file, portfolios)
 
 
-# --- rates ---
-
-def load_rates() -> dict:
-    """Курсы валют. По умолчанию — фиксированные значения-заглушки."""
-    default = {
+def _default_rates() -> dict[str, Any]:
+    """Курсы-заглушки, если rates.json ещё нет."""
+    return {
         "EUR_USD": {"rate": 1.0786, "updated_at": "2025-10-09T10:30:00"},
         "BTC_USD": {"rate": 59337.21, "updated_at": "2025-10-09T10:29:42"},
         "RUB_USD": {"rate": 0.01016, "updated_at": "2025-10-09T10:31:12"},
@@ -69,8 +73,44 @@ def load_rates() -> dict:
         "source": "stub",
         "last_refresh": "2025-10-09T10:35:00",
     }
-    return load_json(RATES_FILE, default)
 
 
-def save_rates(rates: dict) -> None:
-    save_json(RATES_FILE, rates)
+def load_rates() -> dict[str, Any]:
+    """Курсы валют. Если rates.json нет — дефолтные значения-заглушки."""
+    return get_database().load(get_database().rates_file, _default_rates())
+
+
+def save_rates(rates: dict[str, Any]) -> None:
+    get_database().save(get_database().rates_file, rates)
+
+
+# --- совместимость со старым API ---
+
+def ensure_data_dir() -> None:
+    """Создаёт data/ (делегирует в DatabaseManager)."""
+    get_database()._ensure_dir()
+
+
+def load_json(path: Path, default: Any = None) -> Any:
+    """Совместимость: читает JSON по абсолютному пути.
+
+    Оставлено для старых скриптов; в новом коде используйте DatabaseManager.
+    """
+    import json
+
+    if not path.exists():
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(path: Path, data: Any) -> None:
+    """Совместимость: пишет JSON по абсолютному пути."""
+    import json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)

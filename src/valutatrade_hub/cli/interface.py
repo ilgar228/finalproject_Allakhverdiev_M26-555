@@ -8,6 +8,13 @@ import sys
 from prettytable import PrettyTable
 
 from valutatrade_hub.core import usecases
+from valutatrade_hub.core.currencies import list_currencies
+from valutatrade_hub.core.exceptions import (
+    ApiRequestError,
+    CurrencyNotFoundError,
+    InsufficientFundsError,
+    ValutaTradeError,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -43,6 +50,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_rate.add_argument("--from", dest="from_currency", required=True)
     p_rate.add_argument("--to", dest="to_currency", required=True)
 
+    sub.add_parser("list-currencies", help="Показать поддерживаемые валюты")
+
     return parser
 
 
@@ -57,10 +66,13 @@ def _fmt_amount(value: float) -> str:
 
 
 def _fmt_rate(value: float) -> str:
-    """Адаптивное форматирование курса: крупные — с разделителями, мелкие — 8 знаков."""
     if abs(value) >= 1:
         return f"{value:,.2f}"
     return f"{value:.8f}"
+
+
+def _supported_codes() -> str:
+    return ", ".join(c.code for c in list_currencies())
 
 
 # --- обработчики ---
@@ -107,15 +119,8 @@ def _cmd_show_portfolio(args) -> None:
     print(f"ИТОГО: {_fmt_money(data['total'])} {data['base']}")
 
 
-def _cmd_buy(args) -> None:
-    r = usecases.buy(args.currency, args.amount)
-    if r["rate"] is not None:
-        print(
-            f"Покупка выполнена: {_fmt_amount(r['amount'])} {r['currency']} "
-            f"по курсу {_fmt_money(r['rate'])} USD/{r['currency']}"
-        )
-    else:
-        print(f"Покупка выполнена: {_fmt_amount(r['amount'])} {r['currency']}")
+def _print_changes(r: dict, success_word: str) -> None:
+    """Печатает блок 'Изменения в портфеле' для buy/sell."""
     print("Изменения в портфеле:")
     print(
         f"- {r['currency']}: было {_fmt_amount(r['before'])} "
@@ -126,6 +131,18 @@ def _cmd_buy(args) -> None:
             f"- USD: было {_fmt_amount(r['usd_before'])} "
             f"→ стало {_fmt_amount(r['usd_after'])}"
         )
+
+
+def _cmd_buy(args) -> None:
+    r = usecases.buy(args.currency, args.amount)
+    if r["rate"] is not None:
+        print(
+            f"Покупка выполнена: {_fmt_amount(r['amount'])} {r['currency']} "
+            f"по курсу {_fmt_money(r['rate'])} USD/{r['currency']}"
+        )
+    else:
+        print(f"Покупка выполнена: {_fmt_amount(r['amount'])} {r['currency']}")
+    _print_changes(r, "Покупка")
     print(f"Оценочная стоимость покупки: {_fmt_money(r['estimated_usd'])} USD")
 
 
@@ -138,16 +155,7 @@ def _cmd_sell(args) -> None:
         )
     else:
         print(f"Продажа выполнена: {_fmt_amount(r['amount'])} {r['currency']}")
-    print("Изменения в портфеле:")
-    print(
-        f"- {r['currency']}: было {_fmt_amount(r['before'])} "
-        f"→ стало {_fmt_amount(r['after'])}"
-    )
-    if r["currency"] != "USD":
-        print(
-            f"- USD: было {_fmt_amount(r['usd_before'])} "
-            f"→ стало {_fmt_amount(r['usd_after'])}"
-        )
+    _print_changes(r, "Продажа")
     print(f"Оценочная выручка: {_fmt_money(r['estimated_usd'])} USD")
 
 
@@ -165,8 +173,17 @@ def _cmd_get_rate(args) -> None:
         back = usecases.get_rate(dst, src)
         back_suffix = " [устарел]" if back.get("stale") else ""
         print(f"Обратный курс {dst}→{src}: {_fmt_rate(back['rate'])}{back_suffix}")
-    except ValueError:
+    except (ApiRequestError, CurrencyNotFoundError):
         pass
+
+
+def _cmd_list_currencies(args) -> None:
+    table = PrettyTable()
+    table.field_names = ["Код", "Инфо"]
+    table.align = "l"
+    for c in list_currencies():
+        table.add_row([c.code, c.get_display_info()])
+    print(table)
 
 
 _HANDLERS = {
@@ -177,10 +194,34 @@ _HANDLERS = {
     "buy": _cmd_buy,
     "sell": _cmd_sell,
     "get-rate": _cmd_get_rate,
+    "list-currencies": _cmd_list_currencies,
 }
 
 
 # --- разбор строки и выполнение ---
+
+def _print_error(exc: Exception) -> None:
+    """Печатает пользовательское сообщение для исключения."""
+    if isinstance(exc, InsufficientFundsError):
+        print(f"Ошибка: {exc}", file=sys.stderr)
+    elif isinstance(exc, CurrencyNotFoundError):
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        print(
+            f"Поддерживаемые коды: {_supported_codes()}. "
+            "См. help или команду list-currencies.",
+            file=sys.stderr,
+        )
+    elif isinstance(exc, ApiRequestError):
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        print(
+            "Повторите попытку позже или проверьте подключение к сети.",
+            file=sys.stderr,
+        )
+    elif isinstance(exc, ValutaTradeError):
+        print(f"Ошибка: {exc}", file=sys.stderr)
+    else:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+
 
 def _dispatch(argv: list[str], parser: argparse.ArgumentParser) -> int:
     """Парсит argv, вызывает обработчик, ловит логические ошибки."""
@@ -198,6 +239,9 @@ def _dispatch(argv: list[str], parser: argparse.ArgumentParser) -> int:
     except (ValueError, TypeError) as e:
         print(f"Ошибка: {e}", file=sys.stderr)
         return 1
+    except ValutaTradeError as e:
+        _print_error(e)
+        return 1
     return 0
 
 
@@ -211,6 +255,7 @@ _HELP_TEXT = """Доступные команды:
   buy --currency <str> --amount <float>        Покупка
   sell --currency <str> --amount <float>       Продажа
   get-rate --from <str> --to <str>             Курс валюты
+  list-currencies                              Список валют
   help                                         Справка
   exit | quit                                  Выход из программы"""
 
