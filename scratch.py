@@ -1,33 +1,28 @@
-from valutatrade_hub.core import usecases, utils
+from valutatrade_hub.decorators import log_action
+from valutatrade_hub.logging_config import get_logger
 
-# чистим данные для чистого теста
-utils.save_users([])
-utils.save_portfolios([])
 
-print("register:", usecases.register("alice", "1234"))
-print("login:", usecases.login("alice", "1234"))
-print("portfolio empty:", usecases.show_portfolio())
+@log_action("REGISTER")
+def fake_register(username, password):
+    return {"username": username}
 
-print("buy BTC:", usecases.buy("btc", 0.05))
-print("buy USD:", usecases.buy("usd", 1500))
-print("portfolio:", usecases.show_portfolio())
 
-print("sell BTC:", usecases.sell("BTC", 0.01))
-print("rate BTC->USD:", usecases.get_rate("BTC", "USD"))
-print("rate USD->BTC:", usecases.get_rate("usd", "btc"))
+@log_action("BUY", verbose=True)
+def fake_buy(currency, amount):
+    return {"currency": currency, "amount": amount, "before": 0.0, "after": amount}
 
-usecases.logout()
+
+@log_action("SELL")
+def fake_sell(currency, amount):
+    raise ValueError("недостаточно средств")
+
+
+print(fake_register(username="alice", password="1234"))
+print(fake_buy(currency="BTC", amount=0.05))
 try:
-    usecases.buy("BTC", 0.01)
+    fake_sell(currency="BTC", amount=10)
 except ValueError as e:
-    print("not logged ->", e)
+    print("caught:", e)
 
-try:
-    usecases.register("alice", "1234")
-except ValueError as e:
-    print("dup username ->", e)
-
-try:
-    usecases.sell("ETH", 1)
-except ValueError as e:
-    print("no wallet ->", e)
+logger = get_logger()
+print("log file:", logger.handlers[0].baseFilename)
