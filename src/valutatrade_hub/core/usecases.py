@@ -294,17 +294,27 @@ def _get_rate_from_cache(
 ) -> tuple[float, str | None, dict[str, Any]]:
     """Ищет курс в rates.json (прямой или обратный).
 
+    Поддерживает новый формат {"pairs": {...}, "last_refresh": ...}
+    и старый плоский {"BTC_USD": {...}}.
     Возвращает (rate, updated_at, rates).
     """
     rates = utils.load_rates()
+    pairs = (
+        rates.get("pairs")
+        if isinstance(rates, dict) and "pairs" in rates
+        else rates
+    )
+    if not isinstance(pairs, dict):
+        raise ApiRequestError(f"нет данных для {src}→{dst}")
+
     direct_key = f"{src}_{dst}"
     inverse_key = f"{dst}_{src}"
 
-    if direct_key in rates and isinstance(rates[direct_key], dict):
-        rec = rates[direct_key]
+    if direct_key in pairs and isinstance(pairs[direct_key], dict):
+        rec = pairs[direct_key]
         return float(rec["rate"]), rec.get("updated_at"), rates
-    if inverse_key in rates and isinstance(rates[inverse_key], dict):
-        rec = rates[inverse_key]
+    if inverse_key in pairs and isinstance(pairs[inverse_key], dict):
+        rec = pairs[inverse_key]
         inverse = float(rec["rate"])
         rate = 1.0 / inverse if inverse else 0.0
         return rate, rec.get("updated_at"), rates
@@ -341,7 +351,8 @@ def get_rate(from_currency: str, to_currency: str) -> dict:
     updated_dt = _parse_iso(updated_at)
     fresh = True
     if updated_dt is not None:
-        fresh = (datetime.now() - updated_dt) <= _rates_ttl()
+        now = datetime.now(updated_dt.tzinfo) if updated_dt.tzinfo else datetime.now()
+        fresh = (now - updated_dt) <= _rates_ttl()
 
     if not fresh and _strict_ttl():
         # В строгом режиме пытаемся «обновить» — заглушка Parser Service недоступна
@@ -352,7 +363,7 @@ def get_rate(from_currency: str, to_currency: str) -> dict:
     return {
         "rate": rate,
         "updated_at": updated_at,
-        "source": rates.get("source", "cache"),
+        "source": "cache",
         "fresh": fresh,
         "stale": not fresh,
     }

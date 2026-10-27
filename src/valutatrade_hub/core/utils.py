@@ -64,15 +64,8 @@ def save_portfolios(portfolios: list[dict]) -> None:
 
 
 def _default_rates() -> dict[str, Any]:
-    """Курсы-заглушки, если rates.json ещё нет."""
-    return {
-        "EUR_USD": {"rate": 1.0786, "updated_at": "2025-10-09T10:30:00"},
-        "BTC_USD": {"rate": 59337.21, "updated_at": "2025-10-09T10:29:42"},
-        "RUB_USD": {"rate": 0.01016, "updated_at": "2025-10-09T10:31:12"},
-        "ETH_USD": {"rate": 3720.00, "updated_at": "2025-10-09T10:35:00"},
-        "source": "stub",
-        "last_refresh": "2025-10-09T10:35:00",
-    }
+    """Пустой снимок в новом формате (Parser Service заполнит его)."""
+    return {"pairs": {}, "last_refresh": None}
 
 
 def load_rates() -> dict[str, Any]:

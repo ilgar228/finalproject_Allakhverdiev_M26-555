@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 
 from prettytable import PrettyTable
 
@@ -51,6 +52,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_rate.add_argument("--to", dest="to_currency", required=True)
 
     sub.add_parser("list-currencies", help="Показать поддерживаемые валюты")
+
+    p_upd = sub.add_parser("update-rates", help="Обновить курсы из внешних API")
+    p_upd.add_argument(
+        "--source",
+        default=None,
+        help="coingecko | exchangerate (по умолчанию — все)",
+    )
+
+    p_show = sub.add_parser("show-rates", help="Показать курсы из кеша")
+    p_show.add_argument("--currency", default=None)
+    p_show.add_argument("--top", type=int, default=None)
+    p_show.add_argument("--base", default=None)
+
+    p_sched = sub.add_parser("start-scheduler", help="Периодическое обновление")
+    p_sched.add_argument("--interval", type=int, default=300)
 
     return parser
 
@@ -185,6 +201,118 @@ def _cmd_list_currencies(args) -> None:
         table.add_row([c.code, c.get_display_info()])
     print(table)
 
+def _cmd_update_rates(args) -> None:
+    from valutatrade_hub.parser_service.updater import run_update
+
+    print("INFO: Starting rates update...")
+    try:
+        stats = run_update(source=args.source)
+    except ValueError as e:
+        print(f"Ошибка: {e}", file=sys.stderr)
+        return
+
+    for src in stats.get("sources", []):
+        if "error" in src:
+            print(f"ERROR: Failed to fetch from {src['name']}: {src['error']}")
+        else:
+            print(f"INFO: Fetching from {src['name']}... OK ({src['count']} rates)")
+
+    if stats.get("pairs_updated", 0) == 0:
+        print("Update failed: no rates fetched. Check logs for details.")
+        return
+
+    print(
+        f"Update successful. Total rates updated: {stats['pairs_updated']}. "
+        f"Last refresh: {stats['last_refresh']}"
+    )
+    if stats.get("errors", 0):
+        print(f"Update completed with errors: {stats['errors']}. Check logs.")
+
+
+def _cmd_show_rates(args) -> None:
+    from valutatrade_hub.core.utils import load_rates
+
+    data = load_rates()
+    pairs = (
+        data.get("pairs")
+        if isinstance(data, dict) and "pairs" in data
+        else data
+    )
+    if not isinstance(pairs, dict) or not pairs:
+        print(
+            "Локальный кеш курсов пуст. "
+            "Выполните 'update-rates', чтобы загрузить данные."
+        )
+        return
+
+    last_refresh = data.get("last_refresh") if isinstance(data, dict) else None
+    print(f"Rates from cache (updated at {last_refresh or '-'}):")
+
+    rows = []
+    for pair, rec in pairs.items():
+        if not isinstance(rec, dict):
+            continue
+        src_code, _, dst_code = pair.partition("_")
+        rows.append(
+            {
+                "pair": pair,
+                "from": src_code,
+                "to": dst_code,
+                "rate": float(rec.get("rate", 0.0)),
+                "updated_at": rec.get("updated_at"),
+                "source": rec.get("source"),
+            }
+        )
+
+    if args.currency:
+        cur = args.currency.upper()
+        rows = [r for r in rows if r["from"] == cur or r["to"] == cur]
+        if not rows:
+            print(f"Курс для '{cur}' не найден в кеше.")
+            return
+
+    if args.base:
+        base = args.base.upper()
+        rows = [r for r in rows if r["to"] == base or r["from"] == base]
+        if not rows:
+            print(f"Курсы с базой '{base}' не найдены в кеше.")
+            return
+
+    if args.top:
+        rows = sorted(rows, key=lambda r: r["rate"], reverse=True)[: args.top]
+    else:
+        rows = sorted(rows, key=lambda r: r["pair"])
+
+    table = PrettyTable()
+    table.field_names = ["Пара", "Курс", "Обновлено", "Источник"]
+    table.align = "r"
+    for r in rows:
+        table.add_row(
+            [
+                r["pair"],
+                f"{r['rate']:.8f}",
+                r["updated_at"] or "-",
+                r["source"] or "-",
+            ]
+        )
+    print(table)
+
+
+def _cmd_start_scheduler(args) -> None:
+    from valutatrade_hub.parser_service.scheduler import Scheduler
+
+    sched = Scheduler(interval_seconds=args.interval)
+    print(
+        f"Запуск планировщика с интервалом {args.interval} секунд. "
+        "Ctrl+C — остановить."
+    )
+    try:
+        sched.start()
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        sched.stop()
+        print("\nПланировщик остановлен.")
 
 _HANDLERS = {
     "register": _cmd_register,
@@ -195,6 +323,9 @@ _HANDLERS = {
     "sell": _cmd_sell,
     "get-rate": _cmd_get_rate,
     "list-currencies": _cmd_list_currencies,
+    "update-rates": _cmd_update_rates,
+    "show-rates": _cmd_show_rates,
+    "start-scheduler": _cmd_start_scheduler,
 }
 
 
@@ -257,6 +388,9 @@ _HELP_TEXT = """Доступные команды:
   get-rate --from <str> --to <str>             Курс валюты
   list-currencies                              Список валют
   help                                         Справка
+  update-rates [--source <str>]                Обновить курсы (coingecko|exchangerate)
+  show-rates [--currency <str>] [--top <int>]  Курсы из кеша
+  start-scheduler [--interval <int>]           Периодическое обновление
   exit | quit                                  Выход из программы"""
 
 
